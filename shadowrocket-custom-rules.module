@@ -1,9 +1,6 @@
 #!name=Custom Rules
 #!desc=Personal Shadowrocket routing rules for Tailscale, Apple services, and future additions.
 
-[General]
-dns-direct-system = true
-
 [Rule]
 
 DOMAIN-KEYWORD,yueyou,DIRECT
@@ -15,11 +12,6 @@ DOMAIN-KEYWORD,tjshuchen,DIRECT
 # Tailscale 控制服务器、登录、日志和 DERP 中继走代理
 DOMAIN-SUFFIX,tailscale.com,PROXY
 DOMAIN-SUFFIX,tailscale.io,PROXY
-
-# Tailnet 目标流量交给内置 Tailscale
-DOMAIN-SUFFIX,ts.net,TAILSCALE
-IP-CIDR,100.64.0.0/10,TAILSCALE,no-resolve
-IP-CIDR6,fd7a:115c:a1e0::/48,TAILSCALE,no-resolve
 
 # Apple Account
 DOMAIN,account.apple.com,DIRECT
