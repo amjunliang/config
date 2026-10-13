@@ -1,7 +1,26 @@
 #!name=Custom Rules
-#!desc=Personal Shadowrocket routing rules for Tailscale, Apple services, and future additions.
+#!desc=Personal Shadowrocket routing rules for Tailscale, Apple services, Google, and Claude.
 
 [Rule]
+
+# Claude / Anthropic
+DOMAIN-SUFFIX,anthropic.com,PROXY
+DOMAIN-SUFFIX,claude.ai,PROXY
+DOMAIN-SUFFIX,claude.com,PROXY
+DOMAIN-SUFFIX,claude.dev,PROXY
+DOMAIN-SUFFIX,clau.de,PROXY
+
+# Claude user content, Artifacts, browser bridge, and MCP
+DOMAIN-SUFFIX,claudeusercontent.com,PROXY
+DOMAIN-SUFFIX,claudemcpclient.com,PROXY
+DOMAIN-SUFFIX,claudemcpcontent.com,PROXY
+
+# Anthropic website CDN
+DOMAIN,servd-anthropic-website.b-cdn.net,PROXY
+
+# Cloudflare verification
+DOMAIN,challenges.cloudflare.com,PROXY
+
 
 IP-CIDR,179.255.102.77/32,DIRECT,no-resolve
 IP-CIDR,172.100.25.203/32,DIRECT,no-resolve
