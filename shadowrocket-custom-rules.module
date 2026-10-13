@@ -42,3 +42,8 @@ DOMAIN-SUFFIX,push.apple.com,DIRECT
 # iCloud Mail
 DOMAIN-SUFFIX,me.com,DIRECT
 DOMAIN-SUFFIX,mac.com,DIRECT
+
+# Google
+DOMAIN-SUFFIX,googleapis.com,PROXY
+DOMAIN-SUFFIX,gstatic.com,PROXY
+DOMAIN-SUFFIX,google.com,PROXY
