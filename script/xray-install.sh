@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# XRAY_MANAGER_VERSION: 0.1.0
+# XRAY_MANAGER_VERSION: 0.1.1
 # Public source contains no deployment credentials. Requires an interactive terminal.
 set -euo pipefail
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
-  printf '%s\n' 'Xray Manager 0.1.0 — 中文交互式 VPS 管理' \
+  printf '%s\n' 'Xray Manager 0.1.1 — 中文交互式 VPS 管理' \
     '用法：sudo bash xray-install.sh  或  sudo xray-manager' \
     '参数：--status（只读状态）、--check-state（更新兼容检查）、--help' \
-    '所有安装、升级、扩展和回退均从菜单确认；不会自动上传 GitHub。'
+    '安装、升级、扩展和回退均须在菜单中确认。'
   exit 0
 fi
 if ! command -v python3 >/dev/null 2>&1; then
@@ -29,6 +29,7 @@ XRAY_MANAGER_SOURCE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basen
 exec python3 - "$@" <<'XRAY_MANAGER_PY'
 import base64
 import fcntl
+import functools
 import hashlib
 import ipaddress
 import json
@@ -48,10 +49,11 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 SCHEMA = 1
 ROOT = Path('/var/lib/xray-manager')
 CONF = Path('/etc/xray-manager')
@@ -65,10 +67,12 @@ RENEW_UNIT = 'xray-manager-renew.service'
 RENEW_TIMER = 'xray-manager-renew.timer'
 OWN_UNITS = (CORE_UNIT, FRONT_UNIT, RENEW_UNIT, RENEW_TIMER)
 REPO = 'amjunliang/config'
+SCRIPT_PATH = 'script/xray-install.sh'
 API = 'https://api.github.com/repos/'
 TEST_URL = 'https://www.gstatic.com/generate_204'
 TTY = None
 LOCK = None
+DEPLOY_LOCK = None
 
 
 class Problem(Exception):
@@ -180,6 +184,13 @@ def write(path, data, mode=0o600):
             file.flush()
             os.fsync(file.fileno())
         os.replace(temporary, path)
+        # Persist the rename too, so the recovery journal survives a power failure.
+        if platform.system() == 'Linux':
+            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -236,16 +247,27 @@ def port_number(value):
 
 
 def validate_state(state):
+    if not isinstance(state, dict):
+        raise Problem('状态文件必须是 JSON 对象。')
     if state.get('schema') != SCHEMA:
         raise Problem('状态数据版本不兼容；本版只接受 schema=1，不会自动重置数据。')
+    for key in ('core_version', 'core_binary', 'core_binary_sha256', 'address', 'target', 'listen', 'private_key', 'public_key', 'short_id', 'path'):
+        if not isinstance(state.get(key), str):
+            raise Problem('状态数据缺少有效字段：' + key)
+    if state['listen'] not in ('0.0.0.0', '::'):
+        raise Problem('公网监听地址必须是 0.0.0.0 或 ::。')
+    if not re.fullmatch(r'[a-f0-9]{64}', state['core_binary_sha256']):
+        raise Problem('核心摘要格式无效。')
     if not re.fullmatch(r'v\d+(?:\.\d+){2}(?:-\d+)?', state.get('core_version', '')):
         raise Problem('核心版本数据无效。')
-    if not state.get('users') or 'direct' not in state.get('profiles', {}):
+    if not isinstance(state.get('users'), list) or not state['users'] or not isinstance(state.get('profiles'), dict) or 'direct' not in state['profiles']:
         raise Problem('状态数据缺少主入口或用户。')
     server_address(state['address'])
     hostname(state['target'])
     labels, ids, ports = set(), set(), []
     for user in state['users']:
+        if not isinstance(user, dict) or not isinstance(user.get('name'), str) or not isinstance(user.get('id'), str) or not isinstance(user.get('profiles'), list) or any(not isinstance(p, str) for p in user['profiles']):
+            raise Problem('用户记录格式无效。')
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,32}', user['name']) or user['name'] in labels:
             raise Problem('用户名无效或重复。')
         labels.add(user['name'])
@@ -254,6 +276,8 @@ def validate_state(state):
             raise Problem('用户授权或 UUID 无效。')
         ids.add(user['id'])
     for name, profile in state['profiles'].items():
+        if not isinstance(profile, dict) or type(profile.get('port')) is not int:
+            raise Problem('入口端口必须保存为整数。')
         if name not in ('direct', 'vision', 'cdn'):
             raise Problem('发现本版不认识的入口，停止修改。')
         if not any(name in x['profiles'] for x in state['users']):
@@ -272,9 +296,15 @@ def validate_state(state):
         raise Problem('XHTTP 路径数据无效。')
     cdn = state['profiles'].get('cdn')
     if cdn:
+        if cdn['port'] != 443:
+            raise Problem('CDN 公网入口固定使用 443。')
+        if any(not isinstance(cdn.get(key), str) for key in ('domain', 'certificate', 'path')):
+            raise Problem('CDN 域名、证书或路径字段无效。')
         hostname(cdn['domain'])
         if cdn['domain'] == state['target']:
             raise Problem('CDN 域名与 REALITY 目标不能相同。')
+        if any(type(cdn.get(key)) is not int for key in ('reality_internal', 'tls_internal', 'xhttp_internal')):
+            raise Problem('CDN 内部端口必须保存为整数。')
         internals = [port_number(cdn[x]) for x in ('reality_internal', 'tls_internal', 'xhttp_internal')]
         if len(set(internals)) != 3 or set(internals) & set(ports):
             raise Problem('CDN 内部端口冲突。')
@@ -283,7 +313,7 @@ def validate_state(state):
         if Path(cdn['certificate']) != ROOT / 'acme/config/live' / ('xray-manager-' + cdn['domain']):
             raise Problem('证书必须由本脚本的独立 ACME 目录管理。')
     core_path = Path(state['core_binary'])
-    if not str(core_path).startswith(str(LIB / 'versions') + '/') or core_path.name != 'xray':
+    if not core_path.is_absolute() or '..' in core_path.parts or not str(core_path).startswith(str(LIB / 'versions') + '/') or core_path.name != 'xray':
         raise Problem('核心路径不在本脚本版本目录中。')
 
 
@@ -324,6 +354,8 @@ def ensure_free(port):
 
 
 def ensure_platform():
+    if sys.version_info < (3, 9):
+        raise Problem('需要 Python 3.9+；建议 Debian 12+ 或 Ubuntu 22.04+。')
     if platform.system() != 'Linux' or os.geteuid() != 0:
         raise Problem('请在 Debian/Ubuntu VPS 上使用 sudo/root 运行。--help 可以在本机查看。')
     os_release = Path('/etc/os-release').read_text()
@@ -336,15 +368,52 @@ def ensure_platform():
         raise Problem('需要正在运行 systemd 的 VPS，不支持普通 Docker 容器。')
 
 
+def owned_directory(path, mode):
+    path = Path(path)
+    if path.is_symlink() or path.exists() and (not path.is_dir() or path.stat().st_uid != os.geteuid()):
+        raise Problem(f'目录不是当前管理员拥有的普通目录：{path}，停止操作。')
+    path.mkdir(parents=True, exist_ok=True, mode=mode)
+    path.chmod(mode)  # mkdir mode is filtered by umask; chmod restores intended group access.
+
+
 def lock():
     global LOCK
-    ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
-    ROOT.chmod(0o700)
+    owned_directory(ROOT, 0o700)
+    for path in (CONF, LIB):
+        if path.is_symlink() or path.exists() and (not path.is_dir() or path.stat().st_uid != os.geteuid()):
+            raise Problem(f'受管理路径归属异常：{path}，停止操作。')
     LOCK = open(ROOT / 'manager.lock', 'a+')
     try:
         fcntl.flock(LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         raise Problem('另一个管理进程正在运行，请稍后重试。') from None
+
+
+@contextmanager
+def deployment_lock():
+    global DEPLOY_LOCK
+    if DEPLOY_LOCK is not None:
+        yield  # backup/restore are also used inside an already locked transaction.
+        return
+    file = open(ROOT / 'deployment.lock', 'a+')
+    try:
+        try:
+            fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Problem('证书续期或部署变更正在进行，请稍后重试。') from None
+        DEPLOY_LOCK = file
+        yield
+    finally:
+        DEPLOY_LOCK = None
+        file.close()
+
+
+def deployment_locked(function):
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        with deployment_lock():
+            return function(*args, **kwargs)
+    return wrapped
 
 
 def apt_install(packages):
@@ -355,7 +424,7 @@ def apt_install(packages):
 
 
 def base_dependencies():
-    packages = {'curl': 'curl', 'openssl': 'openssl', 'ss': 'iproute2'}
+    packages = {'curl': 'curl', 'openssl': 'openssl', 'ss': 'iproute2', 'flock': 'util-linux'}
     missing = sorted({package for command, package in packages.items() if not shutil.which(command)})
     if not Path('/etc/ssl/certs/ca-certificates.crt').exists():
         missing.append('ca-certificates')
@@ -398,8 +467,7 @@ def download_core(info):
     digest = asset.get('digest') or ''
     if not re.fullmatch(r'sha256:[a-f0-9]{64}', digest):
         raise Problem('官方发布缺少 SHA-256 摘要，本脚本拒绝跳过校验。')
-    LIB.mkdir(parents=True, exist_ok=True)
-    LIB.chmod(0o755)
+    owned_directory(LIB, 0o755)
     versions = LIB / 'versions'
     versions.mkdir(exist_ok=True)
     versions.chmod(0o755)
@@ -595,12 +663,14 @@ WantedBy=multi-user.target
 Description=Renew Xray Manager Certificates
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/certbot renew --quiet --config-dir {acme}/config --work-dir {acme}/work --logs-dir {acme}/logs --deploy-hook {CONF}/reload-front.sh
+ExecStart=/usr/bin/flock --nonblock --conflict-exit-code 75 {ROOT}/deployment.lock /usr/bin/certbot renew --quiet --config-dir {acme}/config --work-dir {acme}/work --logs-dir {acme}/logs --deploy-hook {CONF}/reload-front.sh
+SuccessExitStatus=75
 '''
         files[RENEW_TIMER] = f'''[Unit]
 Description=Daily Xray Manager Certificate Check
 [Timer]
 OnCalendar=daily
+OnUnitInactiveSec=6h
 RandomizedDelaySec=6h
 Persistent=true
 [Install]
@@ -638,6 +708,7 @@ def check_candidate(state, directory):
         run(['/usr/sbin/nginx', '-t', '-c', Path(directory) / 'nginx.conf'])
 
 
+@deployment_locked
 def backup(label):
     directory = ROOT / 'backups' / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + secrets.token_hex(3))
     directory.mkdir(parents=True, mode=0o700)
@@ -678,6 +749,37 @@ def restart_deployment(state):
             raise Problem(f'{name} 启动失败，请查看日志。')
 
 
+def stop_managed():
+    # Stop renewal first; its deploy hook must not reload a half-replaced frontend.
+    for name in (RENEW_TIMER, RENEW_UNIT, FRONT_UNIT, CORE_UNIT):
+        if (UNITS / name).exists() or active(name):
+            systemctl('stop', name)
+
+
+def ensure_account():
+    group = run(['getent', 'group', 'xray-manager'], check=False)
+    account = run(['getent', 'passwd', 'xray-manager'], check=False)
+    owned = (ROOT / 'account-owned').exists() or (ROOT / 'state.json').exists()
+    if not owned and (group.returncode == 0 or account.returncode == 0):
+        raise Problem('发现已有同名用户或组，不自动授权其读取代理密钥。')
+    if group.returncode == 0:
+        fields = (group.stdout or '').strip().split(':')
+        if len(fields) != 4 or fields[2] == '0' or fields[3]:
+            raise Problem('专用组无效、具有 root GID 或包含其他成员。')
+    if account.returncode == 0:
+        fields = (account.stdout or '').strip().split(':')
+        if len(fields) != 7 or fields[2] == '0' or fields[6] not in ('/usr/sbin/nologin', '/sbin/nologin', '/bin/false'):
+            raise Problem('专用账户权限或登录 shell 异常。')
+        if group.returncode != 0 or fields[3] != group.stdout.strip().split(':')[2]:
+            raise Problem('专用账户与专用组不匹配。')
+    write(ROOT / 'account-owned', 'Dedicated non-login account managed by xray-manager.\n')
+    if group.returncode:
+        run(['groupadd', '--system', 'xray-manager'])
+    if account.returncode:
+        run(['useradd', '--system', '--gid', 'xray-manager', '--no-create-home', '--home-dir', '/nonexistent', '--shell', '/usr/sbin/nologin', 'xray-manager'])
+
+
+@deployment_locked
 def restore(directory):
     directory = Path(directory)
     metadata = read_json(directory / 'metadata.json')
@@ -686,13 +788,15 @@ def restore(directory):
         validate_state(restored_state)
         if not Path(restored_state['core_binary']).exists() or sha(restored_state['core_binary']) != restored_state['core_binary_sha256']:
             raise Problem('备份引用的核心文件缺失或已改变；尚未停止当前服务。')
-    for name in (RENEW_TIMER, RENEW_UNIT, FRONT_UNIT, CORE_UNIT):
-        systemctl('stop', name, check=False)
-        systemctl('disable', name, check=False)
+    stop_managed()
+    for name in OWN_UNITS:
+        if (UNITS / name).exists():
+            systemctl('disable', name)
     if CONF.exists():
         shutil.rmtree(CONF)
     if (directory / 'conf').exists():
         shutil.copytree(directory / 'conf', CONF)
+        CONF.chmod(0o750)
         # copytree preserves modes but not ownership; the unprivileged core needs its group.
         shutil.chown(CONF, group='xray-manager')
         for name in ('xray.json', 'nginx.conf'):
@@ -728,7 +832,10 @@ def proxy_probe(state, name, external=False):
         port = port_socket.getsockname()[1]
     with tempfile.TemporaryDirectory(prefix='probe-', dir=ROOT) as directory:
         config = Path(directory) / 'client.json'
-        write(config, client_config(state, name, user, None if external else '127.0.0.1', port))
+        client = client_config(state, name, user, None if external else '127.0.0.1', port)
+        probe_user, probe_password = secrets.token_hex(16), secrets.token_hex(24)
+        client['inbounds'][0]['settings'].update(auth='password', accounts=[{'user': probe_user, 'pass': probe_password}])
+        write(config, client)
         log = Path(directory) / 'client.log'
         with log.open('w') as output:
             process = subprocess.Popen([state['core_binary'], 'run', '-config', str(config)], stdout=output, stderr=subprocess.STDOUT)
@@ -745,8 +852,12 @@ def proxy_probe(state, name, external=False):
                         time.sleep(0.1)
                 if not ready:
                     raise Problem('临时测试客户端无法启动。')
-                run(['curl', '--fail', '--silent', '--show-error', '--noproxy', '', '--proxy', f'socks5h://127.0.0.1:{port}',
-                     '--connect-timeout', '10', '--max-time', '25', '-o', '/dev/null', TEST_URL], timeout=30)
+                # Private stdin config keeps temporary SOCKS credentials out of process arguments.
+                run(['curl', '--config', '-', '--fail', '--silent', '--show-error', '--noproxy', '', '--proxy', f'socks5h://127.0.0.1:{port}',
+                     '--connect-timeout', '10', '--max-time', '25', '-o', '/dev/null', TEST_URL], timeout=30,
+                    input=f'proxy-user = "{probe_user}:{probe_password}"\n')
+                if process.poll() is not None:
+                    raise Problem('临时客户端已退出，连接测试结果无效。')
             finally:
                 process.terminate()
                 try:
@@ -779,7 +890,7 @@ def firewall(state, tag):
     # Rules are additive; never enable/reset UFW or modify SSH rules.
     if not shutil.which('ufw'):
         return
-    output = run(['ufw', 'status'], check=False).stdout or ''
+    output = run(['ufw', 'status']).stdout or ''
     if 'Status: active' not in output:
         return
     for port in sorted({x['port'] for x in state['profiles'].values()}):
@@ -796,16 +907,17 @@ def remove_added_rules(tag):
     if not shutil.which('ufw'):
         return
     # Unique transaction comments identify exactly the rules added by this operation.
-    output = run(['ufw', 'status', 'numbered'], check=False).stdout or ''
+    output = run(['ufw', 'status', 'numbered']).stdout or ''
     numbers = []
     for line in output.splitlines():
         match = re.match(r'^\[\s*(\d+)\]', line)
         if match and line.rstrip().endswith('# ' + tag):
             numbers.append(int(match.group(1)))
     for number in sorted(numbers, reverse=True):
-        run(['ufw', '--force', 'delete', str(number)], check=False)
+        run(['ufw', '--force', 'delete', str(number)])
 
 
+@deployment_locked
 def apply(state, label):
     previous = load_state(required=False)
     if previous:
@@ -818,18 +930,11 @@ def apply(state, label):
         ufw_tag = 'xray-manager-' + secrets.token_hex(8)
         write(journal, {'backup': str(snapshot), 'label': label, 'ufw_tag': ufw_tag})
         try:
-            account = run(['id', '-u', 'xray-manager'], check=False)
-            if account.returncode:
-                run(['useradd', '--system', '--no-create-home', '--shell', '/usr/sbin/nologin', 'xray-manager'])
-            elif (account.stdout or '').strip() == '0':
-                raise Problem('同名 xray-manager 账户具有 root UID，拒绝使用。')
-            for unit in (FRONT_UNIT, CORE_UNIT):
-                systemctl('stop', unit, check=False)
-            for unit in (RENEW_TIMER, RENEW_UNIT):
-                systemctl('stop', unit, check=False)
+            ensure_account()
+            stop_managed()
             if CONF.exists():
                 shutil.rmtree(CONF)
-            CONF.mkdir(mode=0o750)
+            owned_directory(CONF, 0o750)
             shutil.chown(CONF, group='xray-manager')
             managed = {}
             for path in Path(directory).iterdir():
@@ -858,8 +963,8 @@ def apply(state, label):
             state['manifest'] = managed
             state['manager_version'] = VERSION
             write(ROOT / 'state.json', state)
-            journal.unlink()
             save_manager()
+            journal.unlink()  # Last commit step: earlier failures still leave a durable recovery record.
             say(f'操作成功；备份：{snapshot.name}')
             say('云平台安全组仍需允许 TCP：' + ', '.join(str(x) for x in sorted({p['port'] for p in state['profiles'].values()})))
             say('本机自测已通过；你所在网络到 VPS 的连通性仍需客户端实测。')
@@ -900,7 +1005,7 @@ def installation():
         say('已安装：保留所有身份和配置，不下载新核心。')
         if confirm('检查当前配置、启动未运行的服务并执行连通测试？'):
             run([state['core_binary'], 'run', '-test', '-config', CONF / 'xray.json'])
-            for unit in (CORE_UNIT, FRONT_UNIT) if 'cdn' in state['profiles'] else (CORE_UNIT,):
+            for unit in (CORE_UNIT, FRONT_UNIT, RENEW_TIMER) if 'cdn' in state['profiles'] else (CORE_UNIT,):
                 systemctl('enable', unit)
                 if not active(unit):
                     systemctl('start', unit)
@@ -982,22 +1087,30 @@ def cdn_dependencies():
         raise Problem('系统 nginx.service 正在运行；不接管或停止其他网站服务。')
     if nginx_present and not owned:
         raise Problem('已有非本脚本管理的 Nginx。首版不自动改动，请使用干净环境或先人工解决冲突。')
+    if Path('/etc/nginx/nginx.conf').exists() and not owned:
+        raise Problem('发现已有 Nginx 配置，不自动安装或改动其服务。')
     packages = ['nginx-core', 'libnginx-mod-stream', 'certbot', 'python3-certbot-dns-cloudflare']
+    runtime_mask = Path('/run/systemd/system/nginx.service')
+    if runtime_mask.exists() or runtime_mask.is_symlink():
+        raise Problem('发现已有 Nginx runtime unit/mask；请先检查 systemctl status nginx，确认后再处理，脚本不自动移除它。')
     # Mask only a not-yet-installed distro service to avoid the package claiming port 80.
     if not nginx_present:
         if (UNITS / 'nginx.service').exists() or active('nginx.service'):
             raise Problem('存在 Nginx 系统服务，停止自动安装。')
-        run(['systemctl', 'mask', '--runtime', 'nginx.service'])
         write(ROOT / 'nginx-owned', 'Installation initiated by xray-manager; distro service must stay disabled.\n')
+    masked = False
     try:
+        # Mask also on retries: a previous apt failure may have installed the executable already.
+        run(['systemctl', 'mask', '--runtime', 'nginx.service'])
+        masked = True
         apt_install(packages)
-        if not nginx_present:
-            systemctl('disable', 'nginx.service', check=False)
-            write(ROOT / 'nginx-owned', 'Installed by xray-manager; distro service is disabled.\n')
+        write(ROOT / 'nginx-owned', 'Installed by xray-manager; distro service is disabled.\n')
     finally:
-        if not nginx_present:
-            run(['systemctl', 'unmask', '--runtime', 'nginx.service'], check=False)
+        if masked:
+            run(['systemctl', 'unmask', '--runtime', 'nginx.service'])
+            # The distro unit is disabled after removing our mask; other masks are never touched.
             systemctl('disable', 'nginx.service', check=False)
+    systemctl('disable', 'nginx.service')
     if not Path('/usr/lib/nginx/modules/ngx_stream_module.so').exists():
         raise Problem('Nginx stream 模块缺失。')
     # Keep nginx workers away from ROOT, whose 0700 mode protects all credentials.
@@ -1042,6 +1155,8 @@ def cdn_wizard():
         draft.pop('credentials', None)
         draft.pop('path', None)
     draft['domain'] = domain
+    if len(domain) > 240:
+        raise Problem('CDN 域名过长，无法安全创建证书目录。')
     draft_save(draft, '域名已填写')
     say(f'步骤 1：在 Cloudflare 为 {domain} 设置 A/AAAA → VPS 的对应公网 IP，并开启橙云。')
     say('只填写 VPS 实际拥有的地址；没有 IPv6 时不要添加 AAAA。请使用专用子域名，避免影响网站。')
@@ -1073,6 +1188,8 @@ def cdn_wizard():
         ensure_free(value)
         draft[key] = value
         draft_save(draft, '内部端口已填写：' + key)
+    if len({draft[key] for key in port_map}) != 3 or {draft[key] for key in port_map} & {p['port'] for p in state['profiles'].values()} or 443 in {draft[key] for key in port_map}:
+        raise Problem('内部端口相互冲突或与公网端口冲突，请返回重新选择；尚未安装依赖或申请证书。')
     draft_save(draft, '待确认安装证书和前端')
     if not confirm(f'新增 {domain}:443 的 XHTTP + TLS + Cloudflare 入口。\n将安装 Nginx/stream、Certbot/DNS 插件；向 CA 提交邮箱、同意其服务条款，并使用 Token 创建/清理 DNS 验证 TXT。\nNginx 按 SNI 分流 443；原 REALITY 公网地址和端口保持不变。内部监听仅限 127.0.0.1。\n会测试证书续期，并建立每日自动续期任务；服务切换时可能短暂重连。\nCloudflare 后台设置、已签发证书及新依赖不会随本地回退自动撤销。'):
         return
@@ -1223,10 +1340,12 @@ def backups_menu():
         return
     current = backup('回退前保护快照')
     journal = ROOT / 'transaction.json'
-    write(journal, {'backup': str(current), 'label': '手动回退'})
+    ufw_tag = 'xray-manager-' + secrets.token_hex(8)
+    write(journal, {'backup': str(current), 'label': '手动回退', 'ufw_tag': ufw_tag})
     try:
         restore(selected)
         if read_json(selected / 'metadata.json')['services'][CORE_UNIT]['active']:
+            firewall(target, ufw_tag)
             health(target)
         else:
             say('该快照保存的是停服状态，已原样恢复；可从菜单 1 启动和检查。')
@@ -1235,6 +1354,7 @@ def backups_menu():
     except BaseException:
         say('目标快照验证失败，恢复回退前状态……')
         restore(current)
+        remove_added_rules(ufw_tag)
         journal.unlink(missing_ok=True)
         raise
 
@@ -1243,7 +1363,7 @@ def update_manager():
     commit = http(API + REPO + '/commits/main')['sha']
     if not re.fullmatch(r'[a-f0-9]{40}', commit):
         raise Problem('仓库提交号格式无效。')
-    metadata = http(API + REPO + '/contents/xray-install.sh?ref=' + commit)
+    metadata = http(API + REPO + '/contents/' + SCRIPT_PATH + '?ref=' + commit)
     if metadata.get('type') != 'file' or metadata.get('encoding') != 'base64':
         raise Problem('仓库尚未发布可识别的管理脚本。')
     content = base64.b64decode(metadata['content'])
@@ -1256,7 +1376,7 @@ def update_manager():
     if version.group(1) == VERSION:
         say('管理脚本已是该版本。')
         return
-    say(f"管理脚本：{VERSION} → {version.group(1)}\n来源：https://github.com/{REPO}/blob/{commit}/xray-install.sh")
+    say(f"管理脚本：{VERSION} → {version.group(1)}\n来源：https://github.com/{REPO}/blob/{commit}/{SCRIPT_PATH}")
     if not confirm('仅更新本地管理脚本；不会自动更新核心。安装前保存当前脚本，替换后退出，下次启动生效。'):
         return
     with tempfile.TemporaryDirectory(prefix='script-', dir=ROOT) as directory:
@@ -1376,7 +1496,7 @@ def main():
     global TTY
     os.umask(0o077)
     os.environ['PATH'] = os.environ.get('PATH', '/usr/bin:/bin') + ':/usr/local/sbin:/usr/sbin:/sbin'
-    if len(sys.argv) > 1 and sys.argv[1] not in ('--status', '--check-state'):
+    if len(sys.argv) > 2 or len(sys.argv) > 1 and sys.argv[1] not in ('--status', '--check-state'):
         raise Problem('未知参数；使用 --help 查看用法。')
     ensure_platform()
     if len(sys.argv) > 1:
