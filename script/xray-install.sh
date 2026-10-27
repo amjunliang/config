@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# XRAY_MANAGER_VERSION: 0.1.1
+# XRAY_MANAGER_VERSION: 0.1.2
 # Public source contains no deployment credentials. Requires an interactive terminal.
 set -euo pipefail
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
-  printf '%s\n' 'Xray Manager 0.1.1 — 中文交互式 VPS 管理' \
+  printf '%s\n' 'Xray Manager 0.1.2 — 中文交互式 VPS 管理' \
     '用法：sudo bash xray-install.sh  或  sudo xray-manager' \
     '参数：--status（只读状态）、--check-state（更新兼容检查）、--help' \
     '安装、升级、扩展和回退均须在菜单中确认。'
@@ -53,7 +53,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 SCHEMA = 1
 ROOT = Path('/var/lib/xray-manager')
 CONF = Path('/etc/xray-manager')
@@ -223,6 +223,39 @@ def hostname(value):
     if len(value) > 253 or len(labels) < 2 or any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', x) for x in labels):
         raise Problem('请输入完整域名，不包含协议、端口、路径或通配符。')
     return value
+
+
+def target_hostname(value):
+    value = value.strip()
+    if not value:
+        raise Problem('目标网站必填，请输入域名或 HTTPS 页面地址。')
+    try:
+        page = urllib.parse.urlsplit(value if '://' in value else 'https://' + value)
+        if page.scheme != 'https' or not page.hostname or page.port not in (None, 443) or page.username is not None or page.password is not None:
+            raise Problem('目标必须是使用 443 端口、不带登录信息的 HTTPS 网站。')
+        host = page.hostname
+    except ValueError:
+        raise Problem('目标页面地址或端口格式不正确。') from None
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return hostname(host)
+    raise Problem('请输入网站域名；REALITY 目标不能直接填写 IP 地址。')
+
+
+def prompt_target(current=None):
+    say('填写 REALITY 目标网站：支持域名或 HTTPS 页面地址，页面路径仅用于输入，不写入配置。')
+    say('将检查证书有效性、域名匹配、TLS 1.3 和 HTTP/2；输入 q 返回菜单。')
+    while True:
+        value = ask('REALITY 目标网站（必填）' if current is None else 'REALITY 目标网站（回车保留）', current)
+        try:
+            target = target_hostname(value)
+            target_check(target)
+        except Problem as exc:
+            say('目标未通过：' + str(exc) + '\n请重新填写，或输入 q 返回。')
+            continue
+        say('检测通过，将使用目标：' + target + ':443；客户端 SNI：' + target)
+        return target
 
 
 def server_address(value):
@@ -1016,8 +1049,7 @@ def installation():
     address = server_address(ask('客户端连接地址（自动检测结果可修改）', addresses.get('IPv4') or addresses.get('IPv6')))
     port = port_number(ask('XHTTP + REALITY 公网端口', 443))
     ensure_free(port)
-    target = hostname(ask('REALITY 目标域名', 'www.microsoft.com'))
-    target_check(target)
+    target = prompt_target()
     info = release()
     if not confirm(f"首次安装 XHTTP + REALITY\n地址：{address}:{port}\n目标：{target}:443\n核心：{info['tag_name']}\n将创建专用服务、系统用户和受限配置；生成全新 UUID/密钥。"):
         return
@@ -1279,8 +1311,7 @@ def configure():
         state['address'] = server_address(ask('新的公网地址', state['address']))
         impact = '直连和 Vision 的导入链接变化；客户端需要重新导入。'
     elif choice == '2':
-        state['target'] = hostname(ask('新的 REALITY 目标', state['target']))
-        target_check(state['target'])
+        state['target'] = prompt_target(state['target'])
         impact = '所有 REALITY 客户端需要重新导入；UUID 和密钥保留。'
     elif choice == '3':
         name = ask('入口名称 direct 或 vision', 'direct')

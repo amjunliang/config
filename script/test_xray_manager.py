@@ -439,7 +439,7 @@ class ManagerTests(unittest.TestCase):
         command.assert_not_called()
 
     def test_self_update_reads_moved_script_from_pinned_commit(self):
-        content = b'#!/bin/bash\n# XRAY_MANAGER_VERSION: 0.1.2\nexit 0\n'
+        content = b'#!/bin/bash\n# XRAY_MANAGER_VERSION: 999.0.0\nexit 0\n'
         metadata = {'type': 'file', 'encoding': 'base64', 'content': base64.b64encode(content).decode(),
                     'sha': m.hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()}
         commit = 'a' * 40
@@ -473,6 +473,35 @@ class ManagerTests(unittest.TestCase):
             if m.LOCK is not None:
                 m.LOCK.close()
                 m.LOCK = None
+
+    def test_target_page_extracts_only_hostname(self):
+        for value in ('www.example.com', 'https://WWW.EXAMPLE.COM/docs?a=1#section', 'www.example.com:443/docs'):
+            self.assertEqual(m.target_hostname(value), 'www.example.com')
+
+    def test_target_page_rejects_empty_insecure_or_unsupported_inputs(self):
+        for value in ('', '  ', 'http://www.example.com', 'https://www.example.com:8443/',
+                      'https://user:password@www.example.com/', 'https://1.1.1.1/',
+                      'https://[2606:4700:4700::1111]/', 'https://www.example.com:invalid/'):
+            with self.subTest(value=value), self.assertRaises(m.Problem):
+                m.target_hostname(value)
+
+    def test_required_target_retries_blank_and_failed_checks_without_a_default(self):
+        with patch.object(m, 'ask', side_effect=['', 'https://bad.example.com/page', 'https://good.example.com/page']) as ask, patch.object(m, 'target_check', side_effect=[m.Problem('TLS check failed'), None]) as check:
+            self.assertEqual(m.prompt_target(), 'good.example.com')
+        self.assertTrue(all(c.args[1] is None for c in ask.call_args_list))
+        self.assertEqual([c.args[0] for c in check.call_args_list], ['bad.example.com', 'good.example.com'])
+
+    def test_target_prompt_cancellation_is_not_swallowed(self):
+        with patch.object(m, 'ask', side_effect=m.Problem('cancelled')), patch.object(m, 'target_check') as check:
+            with self.assertRaises(m.Problem):
+                m.prompt_target()
+        check.assert_not_called()
+
+    def test_initial_install_uses_required_target_before_download(self):
+        with patch.object(m, 'load_state', return_value=None), patch.object(m, 'foreign_install'), patch.object(m, 'detect_addresses', return_value={'IPv4': '8.8.8.8'}), patch.object(m, 'ask', side_effect=['8.8.8.8', '443']), patch.object(m, 'ensure_free'), patch.object(m, 'prompt_target', return_value='chosen.example.com') as target, patch.object(m, 'release', return_value={'tag_name': 'v26.10.21'}), patch.object(m, 'confirm', return_value=False), patch.object(m, 'download_core') as download:
+            m.installation()
+        target.assert_called_once_with()
+        download.assert_not_called()
 
 
 if __name__ == '__main__':
