@@ -25,7 +25,15 @@
 
 ## 安装
 
-先准备 `curl` 和 CA 证书，再在 VPS 的交互终端执行：
+以 **root 登录 VPS**，先安装下载工具和 HTTPS 验证所需的 CA 证书：
+
+```bash
+apt-get update && apt-get install -y curl ca-certificates
+```
+
+`curl` 用于下载脚本，`ca-certificates` 用于验证 HTTPS 网站身份。依赖已经安装时也可以重复执行；root 用户不需要 `sudo`。
+
+接着在同一个 SSH 窗口中运行：
 
 ```bash
 (
@@ -35,21 +43,17 @@
   curl --proto '=https' --tlsv1.2 -fL --retry 3 \
     https://raw.githubusercontent.com/amjunliang/config/main/script/xray-install.sh \
     -o "$installer"
-  if [ "$(id -u)" -eq 0 ]; then
-    bash "$installer"
-  else
-    sudo bash "$installer"
-  fi
+  bash "$installer"
 )
 ```
 
-也可以下载本仓库，在 VPS 上运行 `sudo bash script/xray-install.sh`。菜单需要终端，不支持 `curl | bash`。
+也可以下载本仓库，在 VPS 上运行 `bash script/xray-install.sh`。菜单需要终端，不支持 `curl | bash`。普通用户需先通过 `sudo -i` 切换到 root。
 
 首次部署成功后使用固定命令：
 
 ```bash
-sudo xray-manager          # 打开管理菜单
-sudo xray-manager --status # 只读查看状态
+xray-manager              # 打开管理菜单
+xray-manager --status     # 只读查看状态
 xray-manager --help        # 查看帮助
 ```
 
@@ -71,6 +75,30 @@ root 用户可省略 `sudo`。向导中输入 `q` 返回菜单；执行变更必
 重复运行不会重新安装、轮换 UUID/密钥或自动升级。修改配置会重启相关服务，现有连接可能短暂中断。改变地址、端口或 REALITY 目标后，受影响的客户端需要重新导入。
 
 管理脚本更新与核心升级相互独立。更新脚本时显示明确的来源提交，经确认后替换，下次启动生效。未知状态格式会被拒绝，不会自动清空数据。
+
+## 后续更新
+
+### 更新管理脚本
+
+仓库发布新版本后，在 VPS 上运行：
+
+```bash
+xray-manager
+```
+
+依次选择 **8 更新脚本 → 1 检查并更新管理脚本**。程序会显示本地版本、仓库版本和具体来源提交；确认后校验脚本、检查状态格式兼容性，备份本地旧脚本，再替换 `/usr/local/sbin/xray-manager`。
+
+更新完成会退出菜单，再运行 `xray-manager` 即使用新版。脚本更新不会修改节点、用户、UUID、密钥或 Xray 核心，也不会自动重装服务。没有新版本时会提示已是当前版本。发布脚本代码变更时需要同步更新脚本中的版本标记。
+
+如需退回旧版，选择 **8 更新脚本 → 2 回退管理脚本**，选中历史脚本；兼容检查通过后替换，下次启动生效。
+
+### 升级 Xray 核心
+
+运行 `xray-manager`，选择 **2 升级核心**。查看官方 Latest 和发布说明后，可使用 Latest 或输入指定版本。下载通过 SHA-256 校验后检查现有配置，备份并切换；验证失败恢复原部署。
+
+### 再次下载脚本与更新的区别
+
+再次执行安装下载命令会启动新下载的管理程序，检测到已有部署时不会重装。固定命令 `xray-manager` 仍指向本地已安装的版本；需要更新固定管理命令时，先退出临时下载的菜单，运行 `xray-manager`，再使用上述 **8 → 1** 更新流程。
 
 ## 扩展入口
 
